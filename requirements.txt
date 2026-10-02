@@ -1,0 +1,6 @@
+streamlit
+edge-tts
+imageio-ffmpeg
+deep-translator
+gTTS
+SpeechRecognition
