@@ -10,8 +10,16 @@ import shutil
 import sys
 import asyncio
 import concurrent.futures
+import re
 
 # --- आवश्यक लायब्ररी स्वयंचलित तपासणी व इम्पोर्ट ---
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
 try:
     import edge_tts
 except ImportError:
@@ -37,7 +45,7 @@ except ImportError:
     MyMemoryTranslator = None
 
 try:
-    from gtts import gTTS
+    from gTTS import gTTS
 except ImportError:
     gTTS = None
 
@@ -46,21 +54,36 @@ try:
 except ImportError:
     sr = None
 
-# --- अधिकृत Gemini API Key (स्वयंचलित व सुरक्षित) ---
-_P1 = "AQ.Ab8RN6KSGCPtJ-"
-_P2 = "FluHxxwg1qzC4ASnnrD36LgJyQUGqV0KTvyA"
-DEFAULT_GEMINI_KEY = _P1 + _P2
-
 try:
-    if "GEMINI_API_KEY" in st.secrets and st.secrets["GEMINI_API_KEY"]:
-        DEFAULT_GEMINI_KEY = str(st.secrets["GEMINI_API_KEY"]).strip()
-except Exception:
-    pass
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
-if os.environ.get("GEMINI_API_KEY"):
-    DEFAULT_GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+# --- Gemini API Key सुरक्षित व स्वयंचलित शोध ---
+def get_configured_gemini_key():
+    # 1. Streamlit Secrets (Cloud Deployment साठी)
+    try:
+        if "GEMINI_API_KEY" in st.secrets and st.secrets["GEMINI_API_KEY"]:
+            k = str(st.secrets["GEMINI_API_KEY"]).strip()
+            if k and not k.startswith("AQ."):
+                return k
+    except Exception:
+        pass
+    # 2. Environment Variable
+    env_k = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_k and not env_k.startswith("AQ."):
+        return env_k
+    return ""
 
-# --- अस्सल मानवी आवाजांचे मॅपिंग ---
+def get_configured_openai_key():
+    try:
+        if "OPENAI_API_KEY" in st.secrets and st.secrets["OPENAI_API_KEY"]:
+            return str(st.secrets["OPENAI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.environ.get("OPENAI_API_KEY", "").strip()
+
+# --- अस्सल मानवी आवाजांचे मॅपिंग (Microsoft Edge Neural Voices) ---
 NEURAL_VOICES = {
     "mr": {"female": "mr-IN-AarohiNeural", "male": "mr-IN-ManoharNeural"},
     "ml": {"female": "ml-IN-SobhanaNeural", "male": "ml-IN-MidhunNeural"},
@@ -71,8 +94,6 @@ NEURAL_VOICES = {
     "en": {"female": "en-IN-NeerjaNeural", "male": "en-IN-PrabhatNeural"}
 }
 
-# Amazon & Google स्टँडर्ड: स्थानिक लिपी + इंग्रजी नाव
-# जेणेकरून कोणालाही (उदा. मराठी माणसाला मल्याळम निवडताना) भाषा लगेच ओळखता येईल!
 LANGUAGES = {
     "मराठी (Marathi)": {"code": "mr", "stt_code": "mr-IN", "name": "Marathi"},
     "മലയാളം (Malayalam)": {"code": "ml", "stt_code": "ml-IN", "name": "Malayalam"},
@@ -85,12 +106,12 @@ LANGUAGES = {
 
 lang_names = list(LANGUAGES.keys())
 
-# --- Amazon-शैलीतील स्वच्छ आणि अस्सल स्थानिक भाषा शब्दकोश ---
+# --- Amazon-Google स्टँडर्ड स्थानिक भाषा शब्दकोश ---
 FULL_UI = {
     "mr": {
-        "page_title": "AI व्हॉईस ट्रान्सलेटर",
-        "main_title": "🎙️ AI व्हॉईस ट्रान्सलेटर",
-        "sub_title": "थेट WhatsApp वर पाठवता येणारा अस्सल मानवी व्हॉईस ट्रान्सलेटर ✨",
+        "page_title": "युनिव्हर्सल AI व्हॉईस ट्रान्सलेटर",
+        "main_title": "🎙️ युनिव्हर्सल AI व्हॉईस ट्रान्सलेटर",
+        "sub_title": "बोलीभाषा, स्थानिक संदर्भ व थेट WhatsApp साठी अचूक भाषांतर प्रणाली ✨",
         "lang_section": "🌐 भाषा आणि आवाज निवडा",
         "source_label": "🗣️ तुमची भाषा:",
         "target_label": "🎯 समोरच्याची भाषा:",
@@ -98,29 +119,29 @@ FULL_UI = {
         "gender_label": "👤 आवाज:",
         "male_voice": "पुरुष आवाज",
         "female_voice": "स्त्री आवाज",
-        "input_header": "1️⃣ तुम्ही बोला",
+        "input_header": "1️⃣ तुम्ही बोला किंवा लिहा",
         "record_btn": "🎙️ बोलण्यासाठी येथे दाबा",
-        "manual_expander": "किंवा येथे टाईप करा",
-        "input_placeholder": "वाक्य येथे लिहा...",
-        "recognized_text": "तुम्ही बोललेले वाक्य:",
+        "manual_expander": "किंवा येथे मजकूर टाईप करा",
+        "input_placeholder": "उदा. नमस्कार माझे नाव भगवान आहे. काका कांद्याचा भाव काय चालू आहे?",
+        "recognized_text": "मूळ वाक्य:",
         "transcribing": "आवाज ऐकत आहे...",
-        "translating": "रूपांतर करत आहे...",
-        "generating_voice": "व्हॉईस नोट तयार होत आहे...",
-        "listen_voice": "🔊 आवाज ऐका:",
+        "translating": "Gemini AI द्वारे संदर्भानुसार भाषांतर होत आहे...",
+        "generating_voice": "नैसर्गिक मानवी व्हॉईस नोट तयार होत आहे...",
+        "listen_voice": "🔊 भाषांतरित आवाज ऐका:",
         "download_btn": "🟢 WhatsApp व्हॉईस नोट डाउनलोड करा",
-        "download_help": "WhatsApp मध्ये वेव्हफॉर्मसह वाजते",
-        "share_btn": "📲 WhatsApp वर पाठवा",
-        "output_header": "2️⃣ भाषांतरित आवाज",
-        "output_label": "अचूक भाषांतर:",
+        "download_help": "WhatsApp मध्ये वेव्हफॉर्मसह प्ले होते",
+        "share_btn": "📲 WhatsApp वर थेट पाठवा",
+        "output_header": "2️⃣ भाषांतरित आवाज व मजकूर",
+        "output_label": "अचूक संदर्भानुसार भाषांतर:",
         "engine_label": "इंजिन",
         "voice_label": "आवाज",
-        "sidebar_title": "⚙️ सेटिंग्ज",
-        "emergency_reset": "🔄 मूळ मराठीत रिसेट करा (Reset to Marathi)"
+        "sidebar_title": "⚙️ AI सेटिंग्ज",
+        "emergency_reset": "🔄 मूळ मराठीत रिसेट करा"
     },
     "ml": {
-        "page_title": "AI വോയ്‌സ് ട്രാൻസ്ലേറ്റർ",
-        "main_title": "🎙️ AI വോയ്‌സ് ട്രാൻസ്ലേറ്റർ",
-        "sub_title": "നേരിട്ട് WhatsApp-ലേക്ക് അയക്കാവുന്ന വോയ്‌സ് നോട്ട് ✨",
+        "page_title": "യൂണിവേഴ്സൽ AI വോയ്‌സ് ട്രാൻസ്ലേറ്റർ",
+        "main_title": "🎙️ യൂണിവേഴ്സൽ AI വോയ്‌സ് ട്രാൻസ്ലേറ്റർ",
+        "sub_title": "തത്സമയ സംഭാഷണങ്ങൾ കൃത്യമായി വിവർത്തനം ചെയ്യുക ✨",
         "lang_section": "🌐 ഭാഷയും ശബ്ദവും തിരഞ്ഞെടുക്കുക",
         "source_label": "🗣️ നിങ്ങളുടെ ഭാഷ:",
         "target_label": "🎯 കേൾവിക്കാരന്റെ ഭാഷ:",
@@ -128,29 +149,29 @@ FULL_UI = {
         "gender_label": "👤 ശബ്ദം:",
         "male_voice": "പുരുഷ ശബ്ദം",
         "female_voice": "സ്ത്രീ ശബ്ദം",
-        "input_header": "1️⃣ നിങ്ങൾ സംസാരിക്കുക",
-        "record_btn": "🎙️ സംസാരിക്കാൻ ഇവിടെ അമർത്തുക",
+        "input_header": "1️⃣ സംസാരിക്കുക അല്ലെങ്കിൽ എഴുതുക",
+        "record_btn": "🎙️ സംസാരിക്കാൻ അമർത്തുക",
         "manual_expander": "അല്ലെങ്കിൽ ഇവിടെ ടൈപ്പ് ചെയ്യുക",
-        "input_placeholder": "ഇവിടെ എഴുതുക...",
-        "recognized_text": "നിങ്ങൾ പറഞ്ഞ വാചകം:",
-        "transcribing": "കേൾക്കുന്നു...",
+        "input_placeholder": "വാചകം ഇവിടെ എഴുതുക...",
+        "recognized_text": "യഥാർത്ഥ വാചകം:",
+        "transcribing": "ശ്രദ്ധിക്കുന്നു...",
         "translating": "വിവർത്തനം ചെയ്യുന്നു...",
-        "generating_voice": "ശബ്ദം തയ്യാറാക്കുന്നു...",
+        "generating_voice": "വോയ്‌സ് നോട്ട് തയ്യാറാക്കുന്നു...",
         "listen_voice": "🔊 ശബ്ദം കേൾക്കുക:",
         "download_btn": "🟢 WhatsApp വോയ്‌സ് നോട്ട് ഡൗൺലോഡ് ചെയ്യുക",
-        "download_help": "WhatsApp-ൽ വേവ്ഫോം ആയി പ്ലേ ചെയ്യാം",
+        "download_help": "WhatsApp-ൽ തത്സമയം പ്ലേ ചെയ്യാം",
         "share_btn": "📲 WhatsApp-ൽ അയക്കുക",
         "output_header": "2️⃣ വിവർത്തനം ചെയ്ത ശബ്ദം",
-        "output_label": "ശരിയായ വിവർത്തനം:",
+        "output_label": "കൃത്യമായ വിവർത്തനം:",
         "engine_label": "എഞ്ചിൻ",
         "voice_label": "ശബ്ദം",
-        "sidebar_title": "⚙️ ക്രമീകരണങ്ങൾ",
+        "sidebar_title": "⚙️ AI ക്രമീകരണങ്ങൾ",
         "emergency_reset": "🔄 Reset to Marathi / मराठीत परत या"
     },
     "kn": {
-        "page_title": "AI ಧ್ವನಿ ಅನುವಾದಕ",
-        "main_title": "🎙️ AI ಧ್ವನಿ ಅನುವಾದಕ",
-        "sub_title": "ನೇರವಾಗಿ WhatsApp ಗೆ ಕಳುಹಿಸಬಹುದಾದ ಧ್ವನಿ ಸಂದೇಶ ✨",
+        "page_title": "ಯುನಿವರ್ಸಲ್ AI ಧ್ವನಿ ಅನುವಾದಕ",
+        "main_title": "🎙️ ಯುನಿವರ್ಸಲ್ AI ಧ್ವನಿ ಅನುವಾದಕ",
+        "sub_title": "ನೇರವಾಗಿ WhatsApp ಗೆ ಕಳುಹಿಸಬಹುದಾದ ನಿಖರ ಧ್ವನಿ ಸಂದೇಶ ✨",
         "lang_section": "🌐 ಭಾಷೆ ಮತ್ತು ಧ್ವನಿ ಆಯ್ಕೆಮಾಡಿ",
         "source_label": "🗣️ ನಿಮ್ಮ ಭಾಷೆ:",
         "target_label": "🎯 ಕೇಳುಗರ ಭಾಷೆ:",
@@ -158,11 +179,11 @@ FULL_UI = {
         "gender_label": "👤 ಧ್ವನಿ:",
         "male_voice": "ಪುರುಷ ಧ್ವನಿ",
         "female_voice": "ಮಹಿಳಾ ಧ್ವನಿ",
-        "input_header": "1️⃣ ನೀವು ಮಾತನಾಡಿ",
-        "record_btn": "🎙️ ಮಾತನಾಡಲು ಇಲ್ಲಿ ಒತ್ತಿ",
+        "input_header": "1️⃣ ಮಾತನಾಡಿ ಅಥವಾ ಬರೆಯಿರಿ",
+        "record_btn": "🎙️ ಮಾತನಾಡಲು ಒತ್ತಿ",
         "manual_expander": "ಅಥವಾ ಇಲ್ಲಿ ಟೈಪ್ ಮಾಡಿ",
         "input_placeholder": "ಇಲ್ಲಿ ಬರೆಯಿರಿ...",
-        "recognized_text": "ನೀವು ಹೇಳಿದ ವಾಕ್ಯ:",
+        "recognized_text": "ಮೂಲ ವಾಕ್ಯ:",
         "transcribing": "ಆಲಿಸಲಾಗುತ್ತಿದೆ...",
         "translating": "ಅನುವಾದಿಸಲಾಗುತ್ತಿದೆ...",
         "generating_voice": "ಸಿದ್ಧಪಡಿಸಲಾಗುತ್ತಿದೆ...",
@@ -180,7 +201,7 @@ FULL_UI = {
     "ta": {
         "page_title": "AI குரல் மொழிபெயர்ப்பாளர்",
         "main_title": "🎙️ AI குரல் மொழிபெயர்ப்பாளர்",
-        "sub_title": "நேரடியாக WhatsApp-ல் பகிரக்கூடிய குரல் பதிவு ✨",
+        "sub_title": "நேரடியாக WhatsApp-ல் பகிரக்கூடிய துல்லிய குரல் பதிவு ✨",
         "lang_section": "🌐 மொழி மற்றும் குரல் தேர்வு",
         "source_label": "🗣️ உங்கள் மொழி:",
         "target_label": "🎯 கேட்பவரின் மொழி:",
@@ -188,11 +209,11 @@ FULL_UI = {
         "gender_label": "👤 குரல்:",
         "male_voice": "ஆண் குரல்",
         "female_voice": "பெண் குரல்",
-        "input_header": "1️⃣ நீங்கள் பேசுங்கள்",
+        "input_header": "1️⃣ பேசுங்கள் அல்லது எழுதுங்கள்",
         "record_btn": "🎙️ பேச இங்கே அழுத்தவும்",
         "manual_expander": "அல்லது இங்கே தட்டச்சு செய்யவும்",
         "input_placeholder": "இங்கே எழுதவும்...",
-        "recognized_text": "நீங்கள் பேசிய வாக்கியம்:",
+        "recognized_text": "மூல வாக்கியம்:",
         "transcribing": "கேட்கிறது...",
         "translating": "மொழிபெயர்க்கப்படுகிறது...",
         "generating_voice": "தயாராகிறது...",
@@ -210,7 +231,7 @@ FULL_UI = {
     "te": {
         "page_title": "AI వాయిస్ అనువాదకుడు",
         "main_title": "🎙️ AI వాయిస్ అనువాదకుడు",
-        "sub_title": "నేరుగా WhatsApp లో పంపగల వాయిస్ నోట్ ✨",
+        "sub_title": "నేరుగా WhatsApp లో పంపగల సహజ వాయిస్ నోట్ ✨",
         "lang_section": "🌐 భాష మరియు వాయిస్ ఎంపిక",
         "source_label": "🗣️ మీ భాష:",
         "target_label": "🎯 వినేవారి భాష:",
@@ -218,11 +239,11 @@ FULL_UI = {
         "gender_label": "👤 వాయిస్:",
         "male_voice": "పురుష వాయిస్",
         "female_voice": "స్త్రీ వాయిస్",
-        "input_header": "1️⃣ మీరు మాట్లాడండి",
+        "input_header": "1️⃣ మాట్లాడండి లేదా టైప్ చేయండి",
         "record_btn": "🎙️ మాట్లాడటానికి ఇక్కడ నొక్కండి",
         "manual_expander": "లేదా ఇక్కడ టైప్ చేయండి",
         "input_placeholder": "ఇక్కడ రాయండి...",
-        "recognized_text": "మీరు చెప్పిన వాక్యం:",
+        "recognized_text": "అసలు వాక్యం:",
         "transcribing": "వింటోంది...",
         "translating": "అనువదిస్తోంది...",
         "generating_voice": "సిద్ధమవుతోంది...",
@@ -230,7 +251,7 @@ FULL_UI = {
         "download_btn": "🟢 WhatsApp వాయిస్ నోట్ డౌన్‌లోడ్ చేయండి",
         "download_help": "WhatsApp లో నేరుగా ప్లే అవుతుంది",
         "share_btn": "📲 WhatsApp లో పంపండి",
-        "output_header": "2️⃣ అనువదించబడిన వాయిస్",
+        "output_header": "2️⃣ అనువదించబడిన వాయిസ്",
         "output_label": "సరియైన అనువాదం:",
         "engine_label": "ఇంజిన్",
         "voice_label": "వాయిస్",
@@ -239,7 +260,7 @@ FULL_UI = {
     },
     "hi": {
         "page_title": "AI वॉइस ट्रांसलेटर",
-        "main_title": "🎙️ AI वॉइस ट्रांसलेटर",
+        "main_title": "🎙️ युनिवर्सल AI वॉइस ट्रांसलेटर",
         "sub_title": "सीधे WhatsApp पर भेजने योग्य प्राकृतिक वॉइस नोट ✨",
         "lang_section": "🌐 भाषा और आवाज चुनें",
         "source_label": "🗣️ आपकी भाषा:",
@@ -248,53 +269,53 @@ FULL_UI = {
         "gender_label": "👤 आवाज:",
         "male_voice": "पुरुष आवाज",
         "female_voice": "महिला आवाज",
-        "input_header": "1️⃣ आप बोलें",
-        "record_btn": "🎙️ बोलने के लिए यहां दबाएं",
-        "manual_expander": "या सीधे लिखें",
+        "input_header": "1️⃣ बोलें या लिखें",
+        "record_btn": "🎙️ बोलने के लिए क्लिक करें",
+        "manual_expander": "या यहाँ टाइप करें",
         "input_placeholder": "यहाँ लिखें...",
-        "recognized_text": "बोला गया वाक्य:",
-        "transcribing": "सुन रहा है...",
-        "translating": "अनुवाद हो रहा है...",
-        "generating_voice": "तैयार हो रहा है...",
-        "listen_voice": "🔊 आवाज सुनें:",
+        "recognized_text": "मूल वाक्य:",
+        "transcribing": "आवाज सुन रहा है...",
+        "translating": "सटीक अनुवाद हो रहा है...",
+        "generating_voice": "वॉइस नोट तैयार हो रहा है...",
+        "listen_voice": "🔊 अनुवादित आवाज सुनें:",
         "download_btn": "🟢 WhatsApp वॉइस नोट डाउनलोड करें",
         "download_help": "WhatsApp में वेवफॉर्म के साथ प्ले होगा",
         "share_btn": "📲 WhatsApp पर भेजें",
         "output_header": "2️⃣ अनुवादित आवाज",
-        "output_label": "सटीक अनुवाद:",
+        "output_label": "सटीक संदर्भानुसार अनुवाद:",
         "engine_label": "इंजन",
         "voice_label": "आवाज",
-        "sidebar_title": "⚙️ सेटिंग्स",
+        "sidebar_title": "⚙️ AI सेटिंग्स",
         "emergency_reset": "🔄 Reset to Marathi / मराठीत परत या"
     },
     "en": {
-        "page_title": "AI Voice Translator",
-        "main_title": "🎙️ AI Voice Translator",
-        "sub_title": "Send direct playable voice notes to WhatsApp ✨",
+        "page_title": "Universal AI Voice Translator",
+        "main_title": "🎙️ Universal AI Voice Translator",
+        "sub_title": "Accurate colloquial voice translator with WhatsApp voice notes ✨",
         "lang_section": "🌐 Select Language & Voice",
         "source_label": "🗣️ Your Language:",
         "target_label": "🎯 Recipient's Language:",
         "swap_btn": "🔄 Swap Languages",
-        "gender_label": "👤 Voice:",
+        "gender_label": "👤 Voice Gender:",
         "male_voice": "Male Voice",
         "female_voice": "Female Voice",
-        "input_header": "1️⃣ Speak Here",
-        "record_btn": "🎙️ Click here to speak",
-        "manual_expander": "Or type text directly",
-        "input_placeholder": "Type here...",
-        "recognized_text": "Recognized Speech:",
+        "input_header": "1️⃣ Speak or Type",
+        "record_btn": "🎙️ Click to Speak",
+        "manual_expander": "Or type text here",
+        "input_placeholder": "e.g. Hello, my name is Bhagwan. What is the onion price?",
+        "recognized_text": "Original Text:",
         "transcribing": "Listening...",
-        "translating": "Translating...",
+        "translating": "Translating via Gemini AI...",
         "generating_voice": "Generating voice note...",
         "listen_voice": "🔊 Listen to Voice:",
         "download_btn": "🟢 Download WhatsApp Voice Note",
-        "download_help": "Plays with waveform directly on WhatsApp",
-        "share_btn": "📲 Share to WhatsApp",
-        "output_header": "2️⃣ Translated Voice",
+        "download_help": "Plays with waveform on WhatsApp",
+        "share_btn": "📲 Send via WhatsApp",
+        "output_header": "2️⃣ Translated Voice & Text",
         "output_label": "Accurate Translation:",
         "engine_label": "Engine",
         "voice_label": "Voice",
-        "sidebar_title": "⚙️ Settings",
+        "sidebar_title": "⚙️ AI Settings",
         "emergency_reset": "🔄 Reset to Marathi"
     }
 }
@@ -303,7 +324,7 @@ def get_text(lang_code, key):
     d = FULL_UI.get(lang_code, FULL_UI.get("en", FULL_UI["mr"]))
     return d.get(key, FULL_UI["mr"].get(key, ""))
 
-# --- सेफ कॉलबॅक फंक्शन्स ---
+# --- कॉलबॅक फंक्शन्स ---
 def swap_languages_callback():
     curr_s = st.session_state.get("source_lang_select", lang_names[0])
     curr_t = st.session_state.get("target_lang_select", lang_names[1])
@@ -349,36 +370,88 @@ st.markdown("""
     }
     .output-card {
         background-color: #F8FAFC;
-        border: 1px solid #E2E8F0;
+        border: 1px solid #CBD5E1;
         border-radius: 12px;
         padding: 20px;
         margin-top: 15px;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
     }
-    .badge-success {
+    .badge-gemini {
         background-color: #059669;
         color: white;
-        padding: 4px 10px;
+        padding: 5px 12px;
+        border-radius: 6px;
+        font-size: 0.9rem;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .badge-fallback {
+        background-color: #D97706;
+        color: white;
+        padding: 5px 12px;
         border-radius: 6px;
         font-size: 0.85rem;
         font-weight: bold;
+        display: inline-block;
     }
-    .badge-warn {
+    .badge-voice {
         background-color: #2563EB;
         color: white;
         padding: 4px 10px;
         border-radius: 6px;
         font-size: 0.85rem;
         font-weight: bold;
+        display: inline-block;
     }
     </style>
 """, unsafe_allow_html=True)
 
-# --- हेडर ---
-st.markdown(f"<div class='main-title'>{get_text(active_ui_lang, 'main_title')}</div>", unsafe_allow_html=True)
-st.markdown(f"<div class='sub-title'>{get_text(active_ui_lang, 'sub_title')}</div>", unsafe_allow_html=True)
+# --- कडक System Instruction आणि भारतीय संदर्भ ग्लॉसरी ---
+SYSTEM_INSTRUCTION = """You are an elite, native-level bilingual interpreter and cultural translator for Indian spoken languages (including Marathi, Malayalam, Kannada, Tamil, Telugu, Hindi, English).
+Your mission is to provide 100% accurate, natural, colloquial translation for spoken conversations between ordinary citizens, merchants, farmers, businesspersons, relatives, and friends.
 
-# --- साइडबार ---
+CRITICAL LINGUISTIC AND CONTEXTUAL RULES:
+
+1. STRICT PRESERVATION OF PERSONAL NAMES AND PROPER NOUNS:
+- Indian personal names (e.g., भगवान / Bhagwan, रमेश / Ramesh, सुरेश / Suresh, राम / Ram, विठ्ठल / Vitthal, ज्ञानेश्वर / Dnyaneshwar, मारुती / Maruti, आनंद / Anand, इत्यादी) are PROPER NOUNS referring to human individuals.
+- NEVER EVER translate personal names literally as common nouns, deities, or English words!
+  * FORBIDDEN: Translating 'भगवान' as 'God', 'Lord', 'देव', or Malayalam 'ദൈവം'.
+  * MANDATORY: Transliterate the name phonetically into the target script:
+    - Marathi: भगवान -> Malayalam: ഭഗവാൻ (Bhagwan)
+    - Marathi: रमेश -> Malayalam: രമേഷ് (Ramesh)
+    - Marathi: सुरेश -> Kannada: ಸುರೇಶ್ (Suresh)
+    - Marathi: भगवान -> Kannada: ಭಗವಾನ್ (Bhagwan)
+    - Marathi: भगवान -> Tamil: பகவான் (Bhagwan)
+
+2. COMMERCIAL, MARKET & AGRICULTURAL CONTEXT:
+- In Indian daily life and commerce, words like 'भाव' (Bhav), 'दर' (Dar), 'किंमत' (Kimmat) refer to "market rate", "selling price", or "commodity cost".
+- NEVER EVER translate 'भाव' as "inflation rate" (महागाईचा दर / നാണയപ്പെരുപ്പ നിരക്ക്), "economic inflation index", or "emotion/sentiment"!
+  * Example: "कांद्याचा भाव काय चालू आहे" means "What is the market price of onions right now?"
+    - Correct Malayalam: "ഉള്ളിയുടെ വില / റേറ്റ് എന്താണ്?" or "ഉള്ളിക്ക് ഇപ്പോൾ എന്ത് വിലയുണ്ട്?"
+    - Correct Kannada: "ಈರುಳ್ಳಿ ಬೆಲೆ / ರೇಟ್ ಎಷ್ಟಿದೆ?"
+    - Correct Tamil: "வெங்காயத்தின் விலை / ரேட் என்ன?"
+    - Correct Telugu: "ఉల్లిపాయల రేటు ఎంత?"
+
+3. CULTURAL RESPECT MARKERS & HONORIFICS:
+- Words like 'काका' (Kaka), 'मामा' (Mama), 'भाऊ' (Bhau), 'दादा' (Dada), 'अण्णा' (Anna) are terms of respect and social warmth.
+- Translate them naturally into the target language's spoken honorifics:
+  * In Malayalam: 'भाऊ' -> 'ചേട്ടാ' (Chetta), 'काका' -> 'അങ്കിൾ' (Uncle) or 'അമ്മാവാ' / 'ചേട്ടാ'.
+  * In Kannada: 'भाऊ' / 'दादा' -> 'ಅಣ್ಣ' (Anna), 'काका' -> 'ಕಾಕ' / 'ಚಿಕ್ಕಪ್ಪ'.
+  * In Tamil: 'भाऊ' / 'दादा' -> 'அண்ணா' (Anna), 'काका' -> 'சித்தப்பா' / 'மாமா'.
+  * In Telugu: 'भाऊ' / 'दादा' -> 'అన్నా' (Anna), 'काका' -> 'బాబాయ్' / 'అంకుల్'.
+- NEVER translate them into English slang like "Bro", "dude", or stiff dictionary definitions.
+
+4. SPOKEN COLLOQUIAL FLUENCY:
+- Output natural, flowing spoken language that sounds like a real human talking on a phone call or sending a WhatsApp voice note.
+- Absolutely NO robotic, literal word-by-word substitution.
+- Preserve the exact conversational tone (friendly, respectful, inquiry, trade).
+
+5. OUTPUT RESTRICTIONS:
+- Output ONLY the final translated sentence in the target language script.
+- Do NOT include notes, explanations, phonetic romanization in brackets, quotation marks, or prefixes.
+"""
+
+# --- साइडबार कॉन्फिगरेशन ---
 with st.sidebar:
     st.header(get_text(active_ui_lang, "sidebar_title"))
     
@@ -387,12 +460,45 @@ with st.sidebar:
         on_click=reset_to_marathi_callback,
         use_container_width=True
     )
+    st.markdown("---")
 
+    configured_key = get_configured_gemini_key()
     gemini_key = st.text_input(
-        "Google Gemini API Key:",
-        value=DEFAULT_GEMINI_KEY,
-        type="password"
+        "🔑 Google Gemini API Key:",
+        value=configured_key,
+        type="password",
+        help="Google AI Studio (aistudio.google.com) वरून मोफत API Key मिळवा."
     )
+
+    model_options = ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+    selected_model = st.selectbox(
+        "🧠 AI मॉडेल:",
+        model_options,
+        index=0,
+        help="Gemini 1.5 Pro हे बोलीभाषा व संदर्भासाठी सर्वोत्तम मॉडेल आहे."
+    )
+
+    if gemini_key and gemini_key.strip():
+        os.environ["GEMINI_API_KEY"] = gemini_key.strip()
+        st.success(f"✅ Gemini LLM सक्रिय ({selected_model})")
+    else:
+        st.warning("⚠️ अचूक भाषांतरासाठी Gemini API Key टाका (किंवा Streamlit Cloud Secrets मध्ये जोडा).")
+
+    st.markdown("---")
+    configured_openai = get_configured_openai_key()
+    openai_key = st.text_input(
+        "🎙️ OpenAI Whisper Key (ऐच्छिक):",
+        value=configured_openai,
+        type="password",
+        help="उच्च दर्जाच्या Whisper STT साठी OpenAI Key (नसल्यास मोफत Google STT वापरले जाईल)."
+    )
+
+# --- हेडर ---
+st.markdown(f"<div class='main-title'>{get_text(active_ui_lang, 'main_title')}</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='sub-title'>{get_text(active_ui_lang, 'sub_title')}</div>", unsafe_allow_html=True)
+
+if not (gemini_key and gemini_key.strip()):
+    st.info("💡 **टीप:** नावांचे अचूक उच्चार (उदा. 'भगवान'चे 'देव' न होणे) आणि 'कांद्याचा भाव' अचूक ओळखण्यासाठी डाव्या बाजूला तुमची **Google Gemini API Key** प्रविष्ट करा. [Google AI Studio वरून मोफत की मिळवा](https://aistudio.google.com/app/apikey).")
 
 # --- भाषा निवड व १००% चालणारे SWAP बटण ---
 st.markdown(f"### {get_text(active_ui_lang, 'lang_section')}")
@@ -427,7 +533,7 @@ target_info = LANGUAGES[target_lang_name]
 src_code = source_info["code"]
 tgt_code = target_info["code"]
 
-# आवाज प्रकार निवड (Amazon-style clean)
+# आवाज प्रकार निवड (पुरुष / स्त्री)
 v_col1, v_col2 = st.columns(2)
 with v_col1:
     voice_gender = st.radio(
@@ -439,114 +545,167 @@ with v_col1:
 
 st.markdown("---")
 
-# --- फंक्शन: Gemini AI द्वारे अस्सल मानवी भाषांतर ---
-def translate_with_gemini_ai(text, src_name, tgt_name, api_key):
+# --- फंक्शन: Google Gemini 1.5 Pro / Flash द्वारे अचूक संदर्भ भाषांतर ---
+def translate_with_gemini_ai(text, src_name, tgt_name, api_key, model_choice="gemini-1.5-pro"):
     if not api_key or not api_key.strip():
         return None, "No API Key"
 
     clean_key = api_key.strip()
-    models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash"]
-    system_prompt = (
-        f"You are a native conversational Indian translator for real-life phone calls between local traders, farmers, and friends. "
-        f"Translate the spoken sentence from {src_name} into natural, colloquial, spoken {tgt_name}. "
-        f"RULES: "
-        f"1. NEVER translate literally. "
-        f"2. Translate cultural honorifics and idioms naturally: "
-        f"   - When addressing someone as 'भाऊ' in business/daily conversation, in Malayalam translate as 'ചേട്ടാ' (Chetta), in Kannada as 'ಅಣ್ಣ' (Anna), in Tamil as 'அண்ணா' (Anna), in Telugu as 'అన్నా' (Anna), NEVER 'Bro'! "
-        f"   - 'भाव काय चालू आहे' / 'काय चालले आहे' means 'What is the rate/price?', so translate naturally into the target language's local market rate inquiry. "
-        f"3. Output ONLY the translated sentence. No explanations, no quotes."
-    )
+    models_to_try = [model_choice]
+    for m in ["gemini-1.5-pro", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]:
+        if m not in models_to_try:
+            models_to_try.append(m)
 
-    payload = {
-        "contents": [{"parts": [{"text": f"Translate this spoken sentence: {text}"}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "generationConfig": {"temperature": 0.2}
-    }
-    data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": clean_key
-    }
+    user_prompt = f"Translate the following spoken sentence from {src_name} to {tgt_name}:\n\"{text}\""
 
-    for model in models:
+    # 1. अधिकृत google-genai SDK वापरणे
+    if genai is not None:
+        for model in models_to_try:
+            try:
+                client = genai.Client(api_key=clean_key)
+                if types is not None and hasattr(types, "GenerateContentConfig"):
+                    config = types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        temperature=0.1
+                    )
+                else:
+                    config = {"system_instruction": SYSTEM_INSTRUCTION, "temperature": 0.1}
+
+                response = client.models.generate_content(
+                    model=model,
+                    contents=user_prompt,
+                    config=config
+                )
+                if response and response.text:
+                    out = response.text.strip().strip('"').strip("'")
+                    return out, f"Google Gemini ({model})"
+            except Exception:
+                continue
+
+    # 2. थेट Google Generative Language REST API (सुरक्षित बॅकअप)
+    for model in models_to_try:
         for ver in ["v1beta", "v1"]:
             try:
-                url = f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent"
-                req = urllib.request.Request(url, data=data, headers=headers)
-                with urllib.request.urlopen(req, timeout=6) as response:
+                url = f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent?key={clean_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": user_prompt}]}],
+                    "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+                    "generationConfig": {"temperature": 0.1}
+                }
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                with urllib.request.urlopen(req, timeout=12) as response:
                     res_json = json.loads(response.read().decode("utf-8"))
                     candidates = res_json.get("candidates", [])
                     if candidates:
                         parts = candidates[0].get("content", {}).get("parts", [])
                         if parts and "text" in parts[0]:
-                            return parts[0]["text"].strip(), f"Gemini AI ({model})"
+                            out = parts[0]["text"].strip().strip('"').strip("'")
+                            return out, f"Google Gemini ({model})"
             except Exception:
                 continue
 
     return None, "Gemini Unavailable"
 
-MYMEMORY_MAP = {
-    "mr": "mr-IN",
-    "ml": "ml-IN",
-    "kn": "kn-IN",
-    "ta": "ta-IN",
-    "te": "te-IN",
-    "hi": "hi-IN",
-    "en": "en-GB"
+# --- स्मार्ट संरक्षित फॉलबॅक भाषांतर (नावे व संदर्भ सुरक्षित ठेवणारे) ---
+NAME_PROTECTION = {
+    "भगवान": {"token": "__NAME_BHAGWAN__", "ml": "ഭഗവാൻ", "kn": "ಭಗವಾನ್", "ta": "பகவான்", "te": "భగవాన్", "hi": "भगवान", "en": "Bhagwan"},
+    "रमेश": {"token": "__NAME_RAMESH__", "ml": "രമേഷ്", "kn": "ರಮೇಶ್", "ta": "ரமேஷ்", "te": "రమేష్", "hi": "रमेश", "en": "Ramesh"},
+    "सुरेश": {"token": "__NAME_SURESH__", "ml": "സുരേഷ്", "kn": "ಸುರೇಶ್", "ta": "சுரேஷ்", "te": "సురేశ్", "hi": "सुरेश", "en": "Suresh"},
+    "विठ्ठल": {"token": "__NAME_VITTHAL__", "ml": "വിഠൽ", "kn": "ವಿಠ್ಠಲ", "ta": "விட்டல்", "te": "విఠల్", "hi": "विट्ठल", "en": "Vitthal"},
+    "ज्ञानेश्वर": {"token": "__NAME_DNYAN__", "ml": "ജ്ഞാനേശ്വർ", "kn": "ಜ್ಞಾನೇಶ್ವರ", "ta": "ஞானேஸ்வர்", "te": "జ్ఞానేశ్వర్", "hi": "ज्ञानेश्वर", "en": "Dnyaneshwar"},
 }
 
 def smart_fallback_translate(text, s_c, t_c):
-    cleaned_text = text
-    if s_c == "mr" and t_c == "ml":
-        if "भाऊ" in text:
-            cleaned_text = cleaned_text.replace("भाऊ", "मोठे बंधू")
-        if "भाव काय चालू आहे" in text or "भावाचे काय चालले" in text:
-            cleaned_text = cleaned_text.replace("भाव काय चालू आहे", "आजचा दर किती आहे")
-            cleaned_text = cleaned_text.replace("भावाचे काय चालले आहे", "आजचा दर किती आहे")
+    cleaned = text
+    restorations = {}
 
-    # 1. MyMemoryTranslator (अत्यंत विश्वासार्ह आणि मोफत)
-    if MyMemoryTranslator:
-        try:
-            s_code = MYMEMORY_MAP.get(s_c, s_c)
-            t_code = MYMEMORY_MAP.get(t_c, t_c)
-            res = MyMemoryTranslator(source=s_code, target=t_code).translate(cleaned_text)
-            if res and not res.startswith("MYMEMORY WARNING"):
-                res = res.replace("ബ്രോ", "ചേട്ടാ").replace("Bro", "Anna")
-                return res, "Conversational AI Engine"
-        except Exception:
-            pass
+    # नावांची सुरक्षा: फॉलबॅक इंजिनला 'भगवान'चे 'God' किंवा 'देव' करू न देणे
+    for name, info in NAME_PROTECTION.items():
+        if name in cleaned:
+            cleaned = cleaned.replace(name, info["token"])
+            restorations[info["token"]] = info.get(t_c, name)
 
-    # 2. Try deep_translator GoogleTranslator
+    # बाजारभाव संदर्भाचे रक्षण
+    if "कांद्याचा भाव" in cleaned:
+        cleaned = cleaned.replace("कांद्याचा भाव", "कांद्याचा आजचा दर")
+    if "भाव काय चालू आहे" in cleaned:
+        cleaned = cleaned.replace("भाव काय चालू आहे", "आजचा दर किती चालू आहे")
+
+    res = None
+    engine_name = "Fallback Engine"
+
+    # 1. GoogleTranslator
     if GoogleTranslator:
         try:
-            res = GoogleTranslator(source=s_c, target=t_c).translate(cleaned_text)
-            if res:
-                res = res.replace("ബ്രോ", "ചേട്ടാ").replace("Bro", "Anna")
-                return res, "Google Translation Engine"
+            res = GoogleTranslator(source=s_c, target=t_c).translate(cleaned)
+            engine_name = "Google Basic Translator"
         except Exception:
             pass
 
-    # 3. Direct google api
-    try:
-        encoded_text = urllib.parse.quote(cleaned_text)
-        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={s_c}&tl={t_c}&dt=t&q={encoded_text}"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode("utf-8"))
-            translated_sentences = "".join([part[0] for part in result[0] if part and part[0]])
-            if translated_sentences:
-                translated_sentences = translated_sentences.replace("ബ്രോ", "ചേട്ടാ")
-                translated_sentences = translated_sentences.replace("Bro", "Anna")
-                return translated_sentences, "GTX Translation Engine"
-    except Exception as e:
-        return None, f"Translate Error: {e}"
+    # 2. MyMemoryTranslator
+    if not res and MyMemoryTranslator:
+        try:
+            mymemory_map = {"mr": "mr-IN", "ml": "ml-IN", "kn": "kn-IN", "ta": "ta-IN", "te": "te-IN", "hi": "hi-IN", "en": "en-GB"}
+            s_m = mymemory_map.get(s_c, s_c)
+            t_m = mymemory_map.get(t_c, t_c)
+            res = MyMemoryTranslator(source=s_m, target=t_m).translate(cleaned)
+            engine_name = "Basic Fallback Translator"
+        except Exception:
+            pass
+
+    # 3. Direct Google GTX API
+    if not res:
+        try:
+            encoded_text = urllib.parse.quote(cleaned)
+            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={s_c}&tl={t_c}&dt=t&q={encoded_text}"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                res = "".join([part[0] for part in result[0] if part and part[0]])
+                engine_name = "GTX Basic Engine"
+        except Exception:
+            pass
+
+    if res:
+        # टोकन्स व नावांची अचूक पुनर्रचना (स्पेस किंवा स्पेलिंग फरकांसह)
+        if "भगवान" in text:
+            tgt_name = NAME_PROTECTION["भगवान"].get(t_c, "Bhagwan")
+            res = re.sub(r'\s*(__\s*NAME_BH[A-Z]*\s*__|XBHAGWANX|ദൈവം|God|Lord)\s*', f' {tgt_name} ', res, flags=re.IGNORECASE)
+        if "रमेश" in text:
+            tgt_name = NAME_PROTECTION["रमेश"].get(t_c, "Ramesh")
+            res = re.sub(r'\s*(__\s*NAME_RAM[A-Z]*\s*__|XRAMESHX)\s*', f' {tgt_name} ', res, flags=re.IGNORECASE)
+        if "सुरेश" in text:
+            tgt_name = NAME_PROTECTION["सुरेश"].get(t_c, "Suresh")
+            res = re.sub(r'\s*(__\s*NAME_SUR[A-Z]*\s*__|XSURESHX)\s*', f' {tgt_name} ', res, flags=re.IGNORECASE)
+
+        for token, target_name in restorations.items():
+            res = res.replace(token, target_name)
+
+        # बोलीभाषेतील आदरयुक्त शब्द व बाजारभाव सुधारणा
+        if t_c == "ml":
+            res = res.replace("ബ്രോ", "ചേട്ടാ").replace("Bro", "ചേട്ടാ")
+            if "ദൈവം" in res and "भगवान" in text:
+                res = res.replace("ദൈവം", "ഭഗവാൻ")
+            if "നാണയപ്പെരുപ്പ" in res:
+                res = res.replace("നാണയപ്പെരുപ്പ നിരക്ക്", "വില / റേറ്റ്").replace("നാണയപ്പെരുപ്പം", "വില")
+            if "നടക്കുന്നത്" in res and "भाव" in text:
+                res = res.replace("നടക്കുന്നത്", "എന്താണ്")
+        elif t_c in ["kn", "ta", "te"]:
+            res = res.replace("Bro", "Anna").replace("bro", "anna")
+
+        res = re.sub(r'\s+', ' ', res).strip()
+        return res, engine_name
 
     return None, "Error"
 
-# --- फंक्शन: सुरक्षित थ्रेडमध्ये Edge TTS चालवणे ---
+# --- फंक्शन: सुरक्षित थ्रेडमध्ये Edge Neural TTS चालवणे ---
 async def _async_edge_tts(text, voice_name, output_path):
     communicate = edge_tts.Communicate(text, voice_name)
     await communicate.save(output_path)
@@ -583,7 +742,7 @@ def generate_natural_voice(text, lang_code, gender):
             fp = io.BytesIO()
             tts.write_to_fp(fp)
             fp.seek(0)
-            return fp.getvalue(), "Google Basic Robot Voice (Fallback)"
+            return fp.getvalue(), "Google Basic Voice (Fallback)"
         except Exception:
             pass
 
@@ -631,27 +790,124 @@ def convert_to_whatsapp_opus(audio_bytes):
             pass
     return None
 
-# --- फंक्शन: आवाज ➔ मजकूर ---
-def transcribe_audio(audio_bytes, s_info):
+# --- फंक्शन: ऑडिओ ऑप्टिमायझेशन (मोठ्या फाईल्स 80% हलक्या करणे) ---
+def optimize_audio_size(audio_bytes):
+    if not audio_bytes or len(audio_bytes) < 512 * 1024:
+        return audio_bytes
+
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe and imageio_ffmpeg:
+        try:
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_exe = None
+
+    if ffmpeg_exe:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as in_f:
+                in_f.write(audio_bytes)
+                in_p = in_f.name
+            out_p = in_p.replace(".wav", "_opt.wav")
+
+            # 16kHz, Mono, 16-bit PCM कॉम्प्रेस
+            cmd = [
+                ffmpeg_exe, "-y", "-i", in_p,
+                "-ar", "16000",
+                "-ac", "1",
+                "-c:a", "pcm_s16le",
+                out_p
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=8)
+            if res.returncode == 0 and os.path.exists(out_p):
+                with open(out_p, "rb") as f:
+                    opt_bytes = f.read()
+                try:
+                    os.remove(in_p)
+                    os.remove(out_p)
+                except Exception:
+                    pass
+                return opt_bytes
+        except Exception:
+            pass
+    return audio_bytes
+
+# --- फंक्शन: Gemini Multimodal द्वारे थेट ऑडिओ वाचन (मोठ्या फाईल्ससाठी) ---
+def transcribe_with_gemini(audio_bytes, s_info, api_key):
+    if not api_key or not api_key.strip() or genai is None:
+        return None
+    try:
+        client = genai.Client(api_key=api_key.strip())
+        prompt = f"Listen carefully to this spoken {s_info['name']} audio. Transcribe the exact words spoken into {s_info['name']} script without missing any word. Return ONLY the transcribed text, no quotes or notes."
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                prompt
+            ]
+        )
+        if response and response.text:
+            return response.text.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return None
+
+# --- फंक्शन: आवाज ➔ मजकूर (Whisper किंवा Google STT किंवा Gemini) ---
+def transcribe_audio(audio_bytes, s_info, openai_api_key=None, gemini_api_key=None):
+    # पायरी १: मोठ्या ऑडिओचे स्वयंचलित कॉम्प्रेशन
+    compact_audio = optimize_audio_size(audio_bytes)
+
+    # 1. Whisper API (उपलब्ध असल्यास)
+    if openai_api_key and openai_api_key.strip() and OpenAI is not None:
+        try:
+            client = OpenAI(api_key=openai_api_key.strip())
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:
+                temp_wav.write(compact_audio)
+                temp_wav_path = temp_wav.name
+            try:
+                with open(temp_wav_path, "rb") as audio_file:
+                    transcript = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        language=s_info["code"],
+                        prompt="मराठी संभाषण, बोलीभाषा, स्थानिक नावे जसे की भगवान, रमेश, बाजारभाव."
+                    )
+                if transcript and transcript.text:
+                    return transcript.text.strip()
+            finally:
+                if os.path.exists(temp_wav_path):
+                    os.remove(temp_wav_path)
+        except Exception:
+            pass
+
+    # 2. मोफत Google Speech Recognition
     if sr:
         recognizer = sr.Recognizer()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:
-            temp_wav.write(audio_bytes)
+            temp_wav.write(compact_audio)
             temp_wav_path = temp_wav.name
 
         try:
             with sr.AudioFile(temp_wav_path) as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.2)
                 audio_data = recognizer.record(source)
                 text = recognizer.recognize_google(audio_data, language=s_info["stt_code"])
-                return text
+                if text:
+                    return text
         except Exception:
-            return None
+            pass
         finally:
             if os.path.exists(temp_wav_path):
                 try:
                     os.remove(temp_wav_path)
                 except Exception:
                     pass
+
+    # 3. Gemini Multimodal Audio (मोठ्या किंवा अस्पष्ट आवाजासाठी अंतिम शक्तिशाली बॅकअप)
+    if gemini_api_key and gemini_api_key.strip():
+        gemini_text = transcribe_with_gemini(compact_audio, s_info, gemini_api_key)
+        if gemini_text:
+            return gemini_text
+
     return None
 
 # --- मुख्य इंटरफेस (Amazon व Google स्टँडर्ड) ---
@@ -667,9 +923,9 @@ with col1:
     if recorded_audio is not None:
         audio_bytes = recorded_audio.read()
         with st.spinner(get_text(src_code, "transcribing")):
-            source_text = transcribe_audio(audio_bytes, source_info)
+            source_text = transcribe_audio(audio_bytes, source_info, openai_key, gemini_key)
 
-    with st.expander(get_text(src_code, "manual_expander")):
+    with st.expander(get_text(src_code, "manual_expander"), expanded=(source_text is None)):
         typed_text = st.text_input(get_text(src_code, "input_placeholder"))
         if typed_text:
             source_text = typed_text
@@ -690,12 +946,14 @@ with col2:
         engine = ""
 
         with st.spinner(get_text(src_code, "translating")):
-            translated_text, engine = translate_with_gemini_ai(
-                source_text,
-                source_info["name"],
-                target_info["name"],
-                gemini_key
-            )
+            if gemini_key and gemini_key.strip():
+                translated_text, engine = translate_with_gemini_ai(
+                    source_text,
+                    source_info["name"],
+                    target_info["name"],
+                    gemini_key,
+                    model_choice=selected_model
+                )
             
             if not translated_text:
                 translated_text, engine = smart_fallback_translate(
@@ -705,7 +963,8 @@ with col2:
                 )
 
         if translated_text:
-            badge_class = "badge-success" if "Gemini" in engine else "badge-warn"
+            is_gemini = "Gemini" in engine
+            badge_class = "badge-gemini" if is_gemini else "badge-fallback"
             st.markdown(f"""
             <div class='output-card'>
                 <span class='{badge_class}'>{get_text(src_code, 'engine_label')}: {engine}</span>
@@ -713,6 +972,9 @@ with col2:
                 <p style='font-size: 1.4rem; color: #047857; font-weight: 700; margin-top: 5px;'>{translated_text}</p>
             </div>
             """, unsafe_allow_html=True)
+
+            if not is_gemini:
+                st.caption("⚠️ हे भाषांतर बेसिक फॉलबॅक इंजिनद्वारे झाले आहे. 100% अचूक बोलीभाषा व संदर्भासाठी सेटिंग्जमध्ये **Gemini API Key** प्रविष्ट करा.")
 
             with st.spinner(get_text(src_code, "generating_voice")):
                 raw_audio, v_engine = generate_natural_voice(translated_text, target_info["code"], gender_key)
@@ -722,9 +984,8 @@ with col2:
                 preview_audio = opus_audio if opus_audio else raw_audio
                 mime_type = "audio/ogg" if opus_audio else "audio/mp3"
 
-                v_badge_class = "badge-success" if "Neural" in v_engine else "badge-warn"
                 st.write("")
-                st.markdown(f"<span class='{v_badge_class}'>{get_text(src_code, 'voice_label')}: {v_engine}</span>", unsafe_allow_html=True)
+                st.markdown(f"<span class='badge-voice'>{get_text(src_code, 'voice_label')}: {v_engine}</span>", unsafe_allow_html=True)
                 st.write(f"{get_text(src_code, 'listen_voice')}")
                 st.audio(preview_audio, format=mime_type, autoplay=True)
 
