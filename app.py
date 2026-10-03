@@ -31,9 +31,10 @@ except ImportError:
         imageio_ffmpeg = None
 
 try:
-    from deep_translator import GoogleTranslator
+    from deep_translator import GoogleTranslator, MyMemoryTranslator
 except ImportError:
     GoogleTranslator = None
+    MyMemoryTranslator = None
 
 try:
     from gtts import gTTS
@@ -484,7 +485,16 @@ def translate_with_gemini_ai(text, src_name, tgt_name, api_key):
 
     return None, "Gemini Unavailable"
 
-# --- बॅकअप भाषांतर ---
+MYMEMORY_MAP = {
+    "mr": "mr-IN",
+    "ml": "ml-IN",
+    "kn": "kn-IN",
+    "ta": "ta-IN",
+    "te": "te-IN",
+    "hi": "hi-IN",
+    "en": "en-GB"
+}
+
 def smart_fallback_translate(text, s_c, t_c):
     cleaned_text = text
     if s_c == "mr" and t_c == "ml":
@@ -494,17 +504,29 @@ def smart_fallback_translate(text, s_c, t_c):
             cleaned_text = cleaned_text.replace("भाव काय चालू आहे", "आजचा दर किती आहे")
             cleaned_text = cleaned_text.replace("भावाचे काय चालले आहे", "आजचा दर किती आहे")
 
-    # 1. Try deep_translator GoogleTranslator
+    # 1. MyMemoryTranslator (अत्यंत विश्वासार्ह आणि मोफत)
+    if MyMemoryTranslator:
+        try:
+            s_code = MYMEMORY_MAP.get(s_c, s_c)
+            t_code = MYMEMORY_MAP.get(t_c, t_c)
+            res = MyMemoryTranslator(source=s_code, target=t_code).translate(cleaned_text)
+            if res and not res.startswith("MYMEMORY WARNING"):
+                res = res.replace("ബ്രോ", "ചേട്ടാ").replace("Bro", "Anna")
+                return res, "Conversational AI Engine"
+        except Exception:
+            pass
+
+    # 2. Try deep_translator GoogleTranslator
     if GoogleTranslator:
         try:
             res = GoogleTranslator(source=s_c, target=t_c).translate(cleaned_text)
             if res:
                 res = res.replace("ബ്രോ", "ചേട്ടാ").replace("Bro", "Anna")
-                return res, "Natural Conversational Engine"
+                return res, "Google Translation Engine"
         except Exception:
             pass
 
-    # 2. Try direct google api
+    # 3. Direct google api
     try:
         encoded_text = urllib.parse.quote(cleaned_text)
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={s_c}&tl={t_c}&dt=t&q={encoded_text}"
@@ -518,9 +540,10 @@ def smart_fallback_translate(text, s_c, t_c):
             if translated_sentences:
                 translated_sentences = translated_sentences.replace("ബ്രോ", "ചേട്ടാ")
                 translated_sentences = translated_sentences.replace("Bro", "Anna")
-                return translated_sentences, "Natural Conversational Engine"
+                return translated_sentences, "GTX Translation Engine"
     except Exception as e:
         return None, f"Translate Error: {e}"
+
     return None, "Error"
 
 # --- फंक्शन: सुरक्षित थ्रेडमध्ये Edge TTS चालवणे ---
@@ -660,13 +683,13 @@ with col1:
         """, unsafe_allow_html=True)
 
 with col2:
-    st.subheader(get_text(tgt_code, "output_header"))
+    st.subheader(f"{get_text(src_code, 'output_header')} ({target_info['name']})")
 
     if source_text:
         translated_text = None
         engine = ""
 
-        with st.spinner(get_text(tgt_code, "translating")):
+        with st.spinner(get_text(src_code, "translating")):
             translated_text, engine = translate_with_gemini_ai(
                 source_text,
                 source_info["name"],
@@ -685,13 +708,13 @@ with col2:
             badge_class = "badge-success" if "Gemini" in engine else "badge-warn"
             st.markdown(f"""
             <div class='output-card'>
-                <span class='{badge_class}'>{get_text(tgt_code, 'engine_label')}: {engine}</span>
-                <p style='margin-top: 10px; font-weight: bold; color: #4B5563;'>{get_text(tgt_code, 'output_label')}</p>
+                <span class='{badge_class}'>{get_text(src_code, 'engine_label')}: {engine}</span>
+                <p style='margin-top: 10px; font-weight: bold; color: #4B5563;'>{get_text(src_code, 'output_label')}</p>
                 <p style='font-size: 1.4rem; color: #047857; font-weight: 700; margin-top: 5px;'>{translated_text}</p>
             </div>
             """, unsafe_allow_html=True)
 
-            with st.spinner(get_text(tgt_code, "generating_voice")):
+            with st.spinner(get_text(src_code, "generating_voice")):
                 raw_audio, v_engine = generate_natural_voice(translated_text, target_info["code"], gender_key)
 
             if raw_audio:
@@ -701,8 +724,8 @@ with col2:
 
                 v_badge_class = "badge-success" if "Neural" in v_engine else "badge-warn"
                 st.write("")
-                st.markdown(f"<span class='{v_badge_class}'>{get_text(tgt_code, 'voice_label')}: {v_engine}</span>", unsafe_allow_html=True)
-                st.write(f"{get_text(tgt_code, 'listen_voice')}")
+                st.markdown(f"<span class='{v_badge_class}'>{get_text(src_code, 'voice_label')}: {v_engine}</span>", unsafe_allow_html=True)
+                st.write(f"{get_text(src_code, 'listen_voice')}")
                 st.audio(preview_audio, format=mime_type, autoplay=True)
 
                 st.markdown("#### 🚀 WhatsApp:")
@@ -712,18 +735,18 @@ with col2:
                 mime_dl = "audio/ogg; codecs=opus" if opus_audio else "audio/mp3"
 
                 st.download_button(
-                    label=get_text(tgt_code, "download_btn"),
+                    label=get_text(src_code, "download_btn"),
                     data=download_data,
                     file_name=f"voice_note_{target_info['code']}.{file_ext}",
                     mime=mime_dl,
                     use_container_width=True,
-                    help=get_text(tgt_code, "download_help")
+                    help=get_text(src_code, "download_help")
                 )
 
                 encoded_msg = urllib.parse.quote(f"*{source_text}*\n\n👉 {translated_text}")
                 wa_url = f"https://api.whatsapp.com/send?text={encoded_msg}"
                 st.link_button(
-                    get_text(tgt_code, "share_btn"),
+                    get_text(src_code, "share_btn"),
                     wa_url,
                     use_container_width=True
                 )
